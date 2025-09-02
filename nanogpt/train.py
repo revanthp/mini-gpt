@@ -10,11 +10,19 @@ from torch import nn
 from loguru import logger
 import click
 from pydantic import BaseModel, Field, ValidationError
+from tqdm import trange
+
 
 from nanogpt.model import GPTConfig, GPT
+from nanogpt.utils.device import get_device, get_dtype
+from nanogpt.utils.timing import TimeIt
 
 class TrainConfig(BaseModel):
     """Configuration for GPT training."""
+    # reproduceable
+    seed: int = Field(default=1337, description="Random seed")
+
+    # monitoring
     out_dir: str = Field(default='out', description="Output directory for checkpoints")
     eval_interval: int = Field(default=2000, description="Interval for evaluation")
     log_interval: int = Field(default=1, description="Interval for logging")
@@ -23,7 +31,9 @@ class TrainConfig(BaseModel):
     always_save_checkpoint: bool = Field(default=True, description="Always save checkpoint after eval")
     init_from: str = Field(default='scratch', description="Model initialization mode")
     dataset: str = Field(default='', description="Dataset name")
-    gradient_accumulation_steps: int = Field(default=40, description="Gradient accumulation steps")
+
+    # Model architecture
+    gradient_accumulation_steps: int = Field(default=64, description="Gradient accumulation steps")
     batch_size: int = Field(default=12, description="Micro-batch size")
     block_size: int = Field(default=1024, description="Block size")
     n_layer: int = Field(default=12, description="Number of transformer layers")
@@ -31,41 +41,22 @@ class TrainConfig(BaseModel):
     n_embd: int = Field(default=768, description="Embedding dimension")
     dropout: float = Field(default=0.0, description="Dropout rate")
     bias: bool = Field(default=False, description="Use bias in LayerNorm/Linear")
+
+    # Optimization
     learning_rate: float = Field(default=6e-4, description="Max learning rate")
-    max_iters: int = Field(default=600000, description="Total training iterations")
+    max_iters: int = Field(default=600_000, description="Total training iterations")
     weight_decay: float = Field(default=1e-1, description="Weight decay for optimizer")
     beta1: float = Field(default=0.9, description="AdamW beta1")
     beta2: float = Field(default=0.95, description="AdamW beta2")
     grad_clip: float = Field(default=1.0, description="Gradient clipping value")
     decay_lr: bool = Field(default=True, description="Use learning rate decay")
     warmup_iters: int = Field(default=2000, description="Warmup iterations")
-    lr_decay_iters: int = Field(default=600000, description="LR decay iterations")
+    lr_decay_iters: int = Field(default=600_000, description="LR decay iterations")
     min_lr: float = Field(default=6e-5, description="Minimum learning rate")
+
+    # runtime complexity optimization
     compile: bool = Field(default=True, description="Use torch.compile for model")
-    seed: int = Field(default=1337, description="Random seed")
 
-def get_device() -> str:
-    """Select device for training, preferring MPS on Mac."""
-    if torch.backends.mps.is_available():
-        logger.info("Using MPS device for training.")
-        return "mps"
-    elif torch.cuda.is_available():
-        logger.info("Using CUDA device for training.")
-        return "cuda"
-    else:
-        logger.info("Using CPU device for training.")
-        return "cpu"
-
-def get_dtype(device: str) -> torch.dtype:
-    """Select dtype for training."""
-    if device == "cuda" and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    elif device == "cuda":
-        return torch.float16
-    elif device == "mps":
-        return torch.float32  # MPS only supports float32 reliably
-    else:
-        return torch.float32
 
 def get_batch(data_dir: str, split: str, batch_size: int, block_size: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
     """Load a batch from memmapped dataset."""
@@ -114,7 +105,7 @@ def main(config, batch_size, eval_only):
     # Load config
     try:
         if config:
-            import json
+            import orjson
             with open(config, 'r') as f:
                 cfg_dict = json.load(f)
             cfg = TrainConfig(**cfg_dict)
@@ -185,21 +176,23 @@ def main(config, batch_size, eval_only):
     ctx = torch.autocast(device_type=device, dtype=dtype) if device != 'cpu' else torch.cpu.amp.autocast(dtype=dtype)
 
     # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
+    optimizer = model.configure_optimizer(cfg.learning_rate, cfg.weight_decay, (cfg.beta1, cfg.beta2))
+
     iter_num = 0
     best_val_loss = float('inf')
 
     # Compile model if requested
     if cfg.compile and hasattr(torch, "compile"):
-        logger.info("Compiling the model with torch.compile...")
-        model = torch.compile(model)
+        with TimeIt("Compiling the model with torch.compile"):
+            model = torch.compile(model)
 
     # Training loop
     X, Y = get_batch(data_dir, 'train', cfg.batch_size, cfg.block_size, device)
     t0 = time.time()
     running_loss = None
 
-    while True:
+    for iter_num in trange(cfg.max_iters + 1, desc="Training Iterations"):
         lr = get_lr(iter_num, cfg) if cfg.decay_lr else cfg.learning_rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr

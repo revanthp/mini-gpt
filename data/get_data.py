@@ -55,7 +55,7 @@ def save_split_to_bin(dset, split: str, dtype: np.dtype = DTYPE) -> None:
     arr_len = np.sum(dset['len'], dtype=np.uint64)
     filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
     arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
-    total_batches = 1024
+    total_batches = min(1024, len(dset))
     idx = 0
     for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
         batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')
@@ -68,7 +68,7 @@ def save_split_to_bin(dset, split: str, dtype: np.dtype = DTYPE) -> None:
 def main() -> None:
     """Main entry point for dataset preprocessing."""
     logger.info("Loading OpenWebText dataset...")
-    dataset = load_dataset('parquet', data_files = "/Users/Rpentya/Documents/GitHub/mini-gpt/data/openwebtext-10k_train.parquet", num_proc=NUM_PROC_LOAD)
+    dataset = load_dataset('parquet', data_files = "/Users/Rpentya/Documents/GitHub/nanogpt/data/openwebtext-10k_train.parquet", num_proc=NUM_PROC_LOAD)
     split_dataset = dataset["train"].train_test_split(test_size=0.0005, seed=2357, shuffle=True)
     split_dataset['val'] = split_dataset.pop('test')
     logger.info(f"Splits: {split_dataset}")
